@@ -435,6 +435,12 @@ function track_resonance(
   , follow_window :: Real = window
   , pick :: Symbol = :closest
 
+  # -- shape constraints
+  , Qs :: Union{AbstractVector{<:Real}, Nothing} = nothing # Q per record
+  , predict :: Bool = false # try to center the search on a linear extrapolation of energies instead of last energy ?
+  , max_slope :: Real = Inf # |dE/dQ| limit from the last point
+  , max_misses :: Int = typemax(Int) # number of allowed misses before the branch is killed
+
   # -- width continuity
   , match_width :: Bool = true
   , width_rtol :: Real = 0.75
@@ -445,17 +451,36 @@ function track_resonance(
 
   nrecords = length(resbyrec)
   tracked = Vector{Union{Resonance, Missing}}(undef, nrecords)
+  Q = Qs === nothing ? collect(1.0:Float64(nrecords)) : Float64.(Qs)
 
   col === nothing && error("Must supply `col`")
 
-  Ecur = float(center)
   Γref = width_ref === nothing ? nothing : float(width_ref)
 
   Γ_ok(r::Resonance, Γref::Float64) =
     !ismissing(r.Γ) && abs(r.Γ - Γref) <= (float(width_atol) + float(width_rtol)*Γref)
 
+  Qp,  Ep  = NaN, NaN # previous accepted points
+  Qpp, Epp = NaN, NaN # previous previous accepted points
   foundres = false
+  ngap     = 0
+  killed   = false
   for i in 1:nrecords
+
+    if killed
+      tracked[i] = missing
+      continue
+    end
+
+    # -- determine where the resonance is expected
+    Ecur = if !foundres
+      float(center)
+    elseif predict && !isnan(Qpp)
+      slope = (Ep - Epp)  / (Qp - Qpp)
+      Ep + slope * (Q[i] - Qp)
+    else
+      Ep
+    end
     win = float((!foundres || !follow) ? window : follow_window)
 
     # -- energy window
@@ -466,8 +491,18 @@ function track_resonance(
       push!(candids, r)
     end
 
+    # -- slope limit (to guard against kinks)
+    if foundres && isfinite(max_slope)
+      ΔQ = abs(Q[i] - Qp)
+      ΔQ > 0 && filter!(r -> abs(r.E - Ep) / ΔQ <= max_slope, candids)
+    end
+
     if isempty(candids)
       tracked[i] = missing
+      if foundres
+        ngap += 1
+        ngap >= max_misses && (killed = true)
+      end
       continue
     end
 
@@ -479,6 +514,8 @@ function track_resonance(
         candids2 = Γmatch
       elseif width_strict
         tracked[i] = missing
+        ngap += 1
+        ngap >= max_misses && (killed = true)
         continue
       end
     end
@@ -490,9 +527,11 @@ function track_resonance(
 
     tracked[i] = chosen
     foundres = true
+    ngap = 0
 
-    # -- update tracking center
-    follow && (Ecur = chosen.E)
+    # -- update previous Q,E
+    Qpp, Epp = Qp, Ep
+    Qp, Ep = Q[i], chosen.E
 
     # -- set width references if not user-supplied
     (ismissing(chosen.Γ) || width_ref !== nothing) && continue
@@ -565,6 +604,7 @@ function track_resonances_auto(
     , width_atol    :: Real                 = 0.0
     , width_strict  :: Bool                 = false
     , width_ref                             = nothing
+    , kwargs...
   )
 
   isempty(records) && error("No records for tracking !")
@@ -614,6 +654,7 @@ function track_resonances_auto(
       , width_atol = width_atol
       , width_strict = width_strict
       , width_ref = width_ref === nothing ? (ismissing(seed.Γ) ? nothing : float(seed.Γ)) : width_ref
+      , kwargs...
     )
 
     nhits = count(!ismissing, tracked)

@@ -11,6 +11,7 @@ export PolyInterp1D
 export PchipInterp1D
 export AkimaInterp1D
 export ExtrapSpec
+export ResonanceGrid
 
 """
     EigenphData
@@ -384,4 +385,29 @@ struct TrackedResonanceBranch
   selector :: Vector{String}
   idxres   :: Vector{IndexedResonance}
   tracked  :: Vector{Union{Resonance, Missing}}
+end
+
+"""
+    ResonanceGrid
+
+In-memory representation of an N-dimensional resonance scan.
+
+Fields:
+
+- `coord_names :: Vector{String}`: coordinate names
+- `coords :: Matrix{Float64}`: `ngeoms x ncoords` displacement values. Row `k`
+    corresponds to geometry index `k`
+- `eigenph :: Vector{EigenphData}`: eigenphase data per geometry
+- `resonances :: Vector{Vector{Resonance}}`: resonances found at each geometry
+- `paths :: Vector{String}`:  path to the eigenphase file per geometry
+- `root :: String`: directory from which the grid was loaded
+
+"""
+struct ResonanceGrid
+  coord_names :: Vector{String}
+  coords      :: Matrix{Float64}
+  eigenph     :: Vector{EigenphData}
+  resonances  :: Vector{Vector{Resonance}}
+  paths       :: Vector{String}
+  root        :: String
 end

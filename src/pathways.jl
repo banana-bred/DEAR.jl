@@ -11,6 +11,7 @@ export fit_path, fit_paths
 export Eres, Γ, V, U, dUds
 export build_dissociation_path,  build_dissociation_path_autostart
 export build_dissociation_paths, build_dissociation_paths_autostart
+export path_effective_mass
 
 ###############
 ### HELPERS ###
@@ -41,9 +42,9 @@ end
 
 Return the dissociation coordinate s or throw an error if it is not in the expected bounds
 """
-function _require_s_in_range(pathfit :: DissociationPathwayFit, s :: Real)
-  smin, smax = extrema(pathfit.s)
+@inline function _require_s_in_range(pathfit :: DissociationPathwayFit, s :: Real)
   sval = Float64(s)
+  smin, smax = first(pathfit.s), last(pathfit.s)   # s is sorted ascending
   smin <= sval <= smax || error("Requested s = $sval is outside the fitted range [$smin,$smax]")
   return sval
 end
@@ -811,6 +812,7 @@ function fit_mode_curve(
     , mode_freqs  :: AbstractDict{String, <:Real} = Dict{String, Float64}()
     , nedge_left  :: Int = 5
     , nedge_right :: Int = 5
+    , Γ_tol_rel   :: Real = 0.05
   )
 
   isempty(curve.Q) &&
@@ -851,29 +853,49 @@ function fit_mode_curve(
   # -- Γ(Q)
   # -------
 
+  # -- get the fit for Γ, avoiding negative widths
+  let ineg = findall(<(0.0), curve.Γ)
+    isempty(ineg) || error(
+      "$(length(ineg)) negative width(s) Γ in the tracked data for $(curve.channel_name)/$(curve.mode_name) at " *
+      "Q = " * join(round.(curve.Q[ineg]; digits=4), ", ") * ". Probably a bad FWHM estimate. " *
+      "Fix the detection (e.g., min_prominence) or drop these geometries"
+    )
+  end
+
   # -- interpolation
   _Γ_fit = _make_interp(curve.Q, curve.Γ; kind=interp.Γ_kind)
 
   # -- extrapolation
   Γ_fit_raw = _wrap_with_extrapolation(
-        _Γ_fit
-      , curve.Q
-      , curve.Γ
-      ; left_kind   = extrap.Γ_left_kind
-      , right_kind  = extrap.Γ_right_kind
-      , Qpad_left   = extrap.EresΓ_Qpad_left
-      , Qpad_right  = extrap.EresΓ_Qpad_right
-      , nedge_left  = nedge_left
-      , nedge_right = nedge_right
-      , clamp_nonnegative = false # how would you interpret Γ<0 ?
-    )
+      _Γ_fit
+    , curve.Q
+    , curve.Γ
+    ; left_kind   = extrap.Γ_left_kind
+    , right_kind  = extrap.Γ_right_kind
+    , Qpad_left   = extrap.EresΓ_Qpad_left
+    , Qpad_right  = extrap.EresΓ_Qpad_right
+    , nedge_left  = nedge_left
+    , nedge_right = nedge_right
+    , clamp_nonnegative = false # how would you interpret Γ<0 ?
+  )
+
+  Γ_scale = maximum(curve.Γ)
+  Γ_tol = Γ_tol_rel * Γ_scale
+
+  # -- ref so it's mutable in the following
+  Γ_warned = Ref(false)
 
   Γ_fit = q -> begin
     val = Γ_fit_raw(q)
-    val < 0.0 && throw(DomainError(val, "negative Γ at Q=$q for $(curve.channel_name)/$(curve.mode_name)"))
-    return val
+    val  >= 0.0 && return val
+    if -val > Γ_tol && !Γ_warned[]
+      Γ_warned[] = true
+        @warn "Γ interpolant for $(curve.channel_name)/$(curve.mode_name) dips down to " *
+              "$(val) at Q = $(q) (|Γ_dip| > $(Γ_tol_rel) × max(Γ)); clamped to 0. " *
+              "If Γ interp = isn't :linear, maybe try that ? "
+    end
+    return 0.0
   end
-
 
   # -------
   # -- V(Q)
@@ -1316,7 +1338,17 @@ function _build_dissociation_path_partial(
   Uvec = Float64[]
   dUdsvec = Float64[]
 
+  # -- set some hard limit so we're not stuck in an infinite loop
+  nmax = ceil(Int, 2*spec.path.smax / spec.path.ds) + 10
+  iter = 0
+
   while true
+    iter += 1
+    if iter > nmax
+      @warn "NMAX ($nmax) reached walking along path for $(surface.channel_name) (direction $(direction)). Truncating"
+      break
+    end
+
     is_in_fit_range(surface, q; pad=range_pad) || break
 
     g = ∇U(surface, q)
@@ -1337,7 +1369,7 @@ function _build_dissociation_path_partial(
     push!(Uvec, Uq)
     push!(dUdsvec, _dUds)
 
-    sval >= spec.path.smax && break
+    abs(sval) >= spec.path.smax && break
 
     q    .-= direction * spec.path.ds .* g ./ gnorm
     sval  += direction * spec.path.ds
@@ -1452,3 +1484,44 @@ V(pathfit    :: DissociationPathwayFit, s :: Real) = pathfit.V_fit(_require_s_in
 U(pathfit    :: DissociationPathwayFit, s :: Real) = pathfit.U_fit(_require_s_in_range(pathfit, s))
 "Fitted dUds(s)"
 dUds(pathfit :: DissociationPathwayFit, s :: Real) = pathfit.dUds_fit(_require_s_in_range(pathfit, s))
+
+"""
+    path_effective_mass(pathfit, mode_freqs)
+
+μ(s) = Σᵢ tᵢ²/ωᵢ along the dissociation path, t = unit tangent in dimensionless mode coordinate Q.
+Frequencies must be in au. Returns a linear interpolant in s.
+"""
+function path_effective_mass(pathfit :: DissociationPathwayFit, mode_freqs :: AbstractDict)
+  s, q = pathfit.s, pathfit.q
+  ns   = length(s)
+  ns >= 2 || error("Need at least 2 path points to define a tangent")
+
+  modes = pathfit.path.modes
+  ω = Vector{Float64}(undef, length(modes))
+  for (i, m) in enumerate(modes)
+    haskey(mode_freqs, m) || error("No frequency supplied for mode '$m'")
+    ω[i] = Float64(mode_freqs[m])
+    ω[i] > 0 || error("Non-positive frequency for mode '$m': $(ω[i])")
+  end
+
+  μ = Vector{Float64}(undef, ns)
+  μ_fallback = sum(1.0 ./ ω) / length(ω)
+
+  for i in 1:ns
+    i1, i2 = i == 1  ? (1, 2) :
+             i == ns ? (ns-1, ns) : (i-1, i+1)
+
+    t  = Float64.(@view q[i2, :]) .- Float64.(@view q[i1, :])
+    tn = norm(t)
+
+    if !isfinite(tn) || tn <= 0.0
+      μ[i] = i > 1 ? μ[i-1] : μ_fallback
+      continue
+    end
+
+    t ./= tn
+    μ[i] = sum(abs2.(t) ./ ω)
+  end
+
+  return _make_interp(s, μ; kind=:linear)
+end

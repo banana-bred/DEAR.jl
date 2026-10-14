@@ -9,6 +9,8 @@ export σ
 export channel_E0
 export get_spinmult
 export resolve_spinwght
+export survival_probability
+export survival_profile
 
 ###############
 ### HELPERS ###
@@ -314,6 +316,52 @@ end
 ######################
 
 """
+    survival_profile(pathfit, energies; E0, mode_freqs, branch_Etot=:inner, tol=1e-10, maxlog=1)
+
+Diagnose the survival probability on an energy grid, without the cross section.
+This is used to report P(ε) per channel and justify (or not) a direct-only treatment.
+
+Warns once if the Eres = 0 crossing fell outside the fitted path at any energy, in which case the
+returned values are upper bounds.
+"""
+function survival_profile(
+      pathfit :: DissociationPathwayFit
+    , energies :: AbstractVector{<:Real}
+    ; E0 :: Real
+    , mode_freqs :: AbstractDict{String, <:Real}
+    , branch_Etot :: Symbol = :inner
+    , tol :: Real = 1e-10
+    , maxlog :: Union{Int, Nothing} = 1 # `nothing` disables the logging limit
+  )
+
+  cache = _path_root_cache(pathfit)
+  μ_eval = path_effective_mass(pathfit, mode_freqs)
+
+  P = Vector{Float64}(undef, length(energies))
+  anytrunc = false
+
+  for (i, ε) in pairs(energies)
+    P[i], is_trunc = survival_probability(
+        pathfit
+      , cache
+      , ε
+      ; E0=E0
+      , μ_eval=μ_eval
+      , branch_Etot=branch_Etot
+      , tol=tol
+    )
+    anytrunc |= is_trunc
+  end
+
+  anytrunc && @warn "Eres = 0 not reached inside the fitted path for channel " *
+                    "$(pathfit.channel); survival probabilities are upper bounds. " *
+                    "Consider increasing `smax`." maxlog=maxlog
+
+  return P
+
+end
+
+"""
     channel_E0(channel, mode_freqs)
 
 Determine the harmonic zero-point energy E0 from a subset of mode frequencies
@@ -333,6 +381,8 @@ Arguments
 - `ε`: electron energy
 - `E0`: the combined zero-point energy of the contributing modes.
 - `ζ_eval`: the ground-state wavefunction evaluator
+- `μ_eval`: effective mass along the path. If `nothing`, the survival factor is
+   omitted (P = 1) and the result is the bare direct cross section.
 - `Etot`: the total energy. If nothing, this is just `E0 + ε`
 - `branch_ε`: how to choose s_ε. See `find_s` for options here
 - `branch_Etot`: very similar to `branch_ε`, but for finding s_E. Same options as `branch_ε` exist, in addition to
@@ -349,6 +399,7 @@ function σ(
   , branch_ε :: Symbol = :inner
   , branch_Etot :: Symbol = :inner
   , tol :: Real = 1e-10
+  , μ_eval = nothing
   )
 
   ε = Float64(ε)
@@ -382,7 +433,14 @@ function σ(
   ζ2 = abs2(ζ_eval(s_Etot)) # |ζ(s_Etot)|²
   k2 = 2.0 * ε # k² = 2E in au
 
-  return 2π^2 * Γε * ζ2 / (k2 * slope)
+  σdirect = 2π^2 * Γε * ζ2 / (k2 * slope)
+
+  # -- survival against autoionization on the way to dissociation
+  μ_eval === nothing && return σdirect
+
+  P, _ = survival_probability(pathfit, cache, s_Etot, _Etot; μ_eval=μ_eval)
+
+  return σdirect * P
 
 end
 
@@ -401,24 +459,26 @@ function σ(
 end
 
 function compute_partial_dissociation(
-      pathfit :: DissociationPathwayFit
-    ; channel :: Channel
-    , Egrid :: AbstractVector{<:Real}
-    , mode_freqs :: AbstractDict{String, <:Real}
+      pathfit         :: DissociationPathwayFit
+    ; channel         :: Channel
+    , Egrid           :: AbstractVector{<:Real}
+    , mode_freqs      :: AbstractDict{String, <:Real}
     , targets_by_mode :: AbstractDict{String, <:TargetState}
-    , spinmult :: Union{Int, Nothing} = nothing
+    , spinmult        :: Union{Int, Nothing} = nothing
     , target_spinmult :: Union{Int, Nothing} = nothing
-    , spin_mode :: Symbol = :auto
+    , spin_mode       :: Symbol = :auto
+    , survival        :: Bool = true
     , kwargs...
   )
 
   E0 = channel_E0(channel, mode_freqs)
   ζ_eval = ζ_path_fit(pathfit, targets_by_mode; kind=:linear)
+  μ_eval = survival ? path_effective_mass(pathfit, mode_freqs) : nothing
 
   family = _family_name(pathfit.channel)
   spinmult, spinwght = resolve_spinwght(family, spinmult, target_spinmult, spin_mode)
 
-  σvals = σ(pathfit, Egrid; E0=E0, ζ_eval=ζ_eval, kwargs...)
+  σvals = σ(pathfit, Egrid; E0=E0, ζ_eval=ζ_eval, μ_eval=μ_eval, kwargs...)
   σvals .*= spinwght
 
   return PartialDissociationResult(
@@ -455,8 +515,10 @@ function compute_total_dissociation(
   npathfits = length(pathfits)
   nchannels == npathfits || error("Number of channels ($nchannels) does not match number of pathfits ($npathfits) ")
 
-  partials = [
-    compute_partial_dissociation(
+  partials = Vector{PartialDissociationResult}(undef, npathfits)
+
+  Threads.@threads for i in eachindex(pathfits, channels)
+    partials[i] = compute_partial_dissociation(
         pathfits[i]
       ; channel=channels[i]
       , Egrid=Egrid
@@ -467,8 +529,7 @@ function compute_total_dissociation(
       , spin_mode=spin_mode
       , kwargs...
     )
-    for i in eachindex(pathfits, channels)
-  ]
+  end
 
   isempty(partials) && error("No partial results to combine !")
 
@@ -513,5 +574,97 @@ function compute_total_dissociation(
     , channel_fractions
     , family_fractions
   )
+
+end
+
+"""
+    survival_probability(pathfit, cache, s0, Etot; μ_eval, rtol=1e-4, tol=1e-10)
+
+This is the core routine to calculate P = exp(-∫ Γ/v ds) from the supplied turning point `s0` (where U(s0) = Etot)
+to the stabilization point Eres = 0, where autoionization shuts off.
+
+Γ is clamped at zero to enforce P ∈ [0, 1], just in case the Γ extrapolation goes negative outside the data range.
+
+Returns `(P, truncated)`. `truncated = true` means Eres = 0 was never reached inside the fitted path
+range, so the integral stopped at the path end and P is an upper bound. Consider extending `smax`
+if this happens.
+"""
+function survival_probability(
+      pathfit :: DissociationPathwayFit
+    , cache
+    , s0      :: Real
+    , Etot    :: Real
+    ; μ_eval
+    , rtol    :: Real = 1e-4
+    , tol     :: Real = 1e-10
+  )
+
+  s0, Etot = Float64(s0), Float64(Etot)
+
+  # -- s is ascending, no need to scan
+  smin_path, smax_path = first(pathfit.s), last(pathfit.s)
+
+  U_fit, Γ_fit = pathfit.U_fit, pathfit.Γ_fit
+
+  # -- dissociation is downhill in U
+  δ = 1e-4 * (smax_path - smin_path)
+  Uplus  = U_fit(clamp(s0 + δ, smin_path, smax_path))
+  Uminus = U_fit(clamp(s0 - δ, smin_path, smax_path))
+  dir = Uplus < Uminus ? 1.0 : -1.0
+
+  # -- stabilization point is the first Eres(s) = 0 crossing ahead of s0
+  roots0 = find_s_all_cached(pathfit, cache.s, cache.Eres_vals, 0.0; kind=:Eres, tol=tol)
+  ahead = filter(r -> dir * (r - s0) > 0, roots0)
+  truncated = isempty(ahead)
+  s1 = truncated ? (dir > 0 ? smax_path : smin_path) :
+                   (dir > 0 ? minimum(ahead) : maximum(ahead))
+
+  a, b = minmax(s0, s1)
+  b - a <= 0 && return (1.0, truncated)
+
+  integrand(s) = begin
+    ΔE = Etot - U_fit(s)
+    ΔE <= 0 && return 0.0  # classically forbidden
+    μs = μ_eval(s)
+    (!isfinite(μs) || μs <= 0) && return 0.0
+    Γs = Γ_fit(s)
+    (!isfinite(Γs) || Γs <= 0) && return 0.0  # clamp extrapolated Γ < 0
+    Γs / sqrt(2.0 * ΔE / μs)
+  end
+
+  # -- Γ/v ~ (s-s0)^(-1/2) at the turning point. Split the s=s0 endpoint for a well-behaved integrand
+  smid = a + 1e-3 * (b - a)
+  val, _ = quadgk(integrand, a, smid, b; rtol=rtol)
+
+  return (min(exp(-val), 1.0), truncated)
+
+end
+
+"""
+    survival_probability(pathfit, cache, ε; E0, μ_eval, Etot=nothing,
+                         branch_Etot=:inner, kwargs...)
+
+Convenience wrapper that solves for the turning point U(s) = Etot, then calls the core routine.
+"""
+function survival_probability(
+      pathfit :: DissociationPathwayFit
+    , cache
+    , ε       :: Real
+    ; E0      :: Real
+    , μ_eval
+    , Etot    :: Union{Real, Nothing} = nothing
+    , branch_Etot :: Symbol = :inner
+    , tol     :: Real = 1e-10
+    , kwargs...
+  )
+
+  _Etot = Etot === nothing ? Float64(E0) + Float64(ε) : Float64(Etot)
+
+  rootsU = find_s_all_cached(pathfit, cache.s, cache.U_vals, _Etot; kind=:U, tol=tol)
+  isempty(rootsU) && return (1.0, false)
+  s0 = select_root(rootsU; branch=branch_Etot)
+  s0 === nothing && return (1.0, false)
+
+  return survival_probability(pathfit, cache, s0, _Etot; μ_eval=μ_eval, tol=tol, kwargs...)
 
 end

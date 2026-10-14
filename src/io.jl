@@ -11,6 +11,7 @@ export load_target_for_mode
 export geom_index
 export select_cols
 export render_table
+export read_mode_potential
 export show_table, write_table
 
 ###############
@@ -108,6 +109,19 @@ function read_eigenph_file(
 
   δ = Float64.(raw[:, 2:end])
   nδ = size(δ,  2)
+
+  # -- enforce non-overlapping energy grid. Sometimes I mess this up in UKRmol+, so I'd rather
+  #    have this code fix it here than give me negative widths Γ. S
+  #    Sort, then retain only the different values
+  idx = sortperm(E)
+  E = E[idx]
+  δ = δ[idx, :]
+  keep = vcat(true, diff(E) .> 0)
+  if !all(keep)
+    @warn "$(basename(path)): $(count(!, keep)) duplicate or non-increasing energy row(s) dropped after sorting" maxlog=1
+    E = E[keep]
+    δ = δ[keep, :]
+  end
 
   tokens = _read_header_tokens(path
     ; comment_char = comment_char
@@ -239,14 +253,13 @@ function load_eigenph_records(
   # -- resolve the geometry file
   gf = geomfile
   if gf === :auto
-    gf = joinpath(root,  "geometries")
-    gf = isfile(gf) ? gf : nothing
-  end
-  # --- resolve geomfile
-  gf = geomfile
-  if gf === :auto
-    cand = joinpath(root, "geometries")
-    gf = isfile(cand) ? cand : nothing
+    gf = nothing
+    for cand in (joinpath(root, "geometries"), joinpath(root, "geometries.molden"))
+      if isfile(cand)
+        gf = cand
+        break
+      end
+    end
   end
 
   # -- build geom -> map
@@ -405,4 +418,39 @@ function load_target_for_mode(mode_root::AbstractString; Q0=0.0)
     te = read_target_energies(path)
     gs = ground_state(te; Q0=Q0)
     return te, gs
+end
+
+"""
+    read_mode_potential(path; comments=true, comment_char='#', name=nothing, Vcol=2)
+
+Reads the ground-state potential for a mode and returns a TargetState. Input file must be in the form
+
+    # some comments      OR         # some comments
+    # Qcol   Vcol                   # Vcol    Qcol
+    Q1      V(Q1)                     V(Q1)   Q1
+    Q2      V(Q2)                     V(Q2)   Q2
+    ...                               ...
+
+Where Vcol is 2 on the left and 1 on the right
+"""
+function read_mode_potential(
+      path :: AbstractString
+    ; comments :: Bool = true
+    , comment_char :: Char = '#'
+    , name :: Union{Nothing, String} = nothing
+    , Vcol :: Int = 2
+  )
+
+  isfile(path) || error("Mode potential file not found: $path")
+  Vcol in (1,2) || error("Vcol can only be 1 or 2")
+
+  raw = readdlm(path; comments=comments, comment_char=comment_char)
+  ndims(raw) == 2 || error("Expected a 2D table, got $(ndims(raw)) in $path")
+  size(raw, 2) == 2 || error("Expected exactly two  columns, got $(size(raw, 2)) in $path")
+
+  Q = Float64.(raw[:, Vcol  == 2 ? 1 : 2])
+  V = Float64.(raw[:, Vcol])
+
+  state_name = name === nothing ? splitext(basename(path))[1] : name
+  return TargetState(Q, V, state_name, 1)
 end
